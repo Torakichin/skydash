@@ -1,0 +1,896 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>SKY DASH - Fly & Avoid</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-touch-callout: none;
+            touch-action: none;
+        }
+
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #0c1017;
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        #game-container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            max-width: 480px;
+            max-height: 854px;
+            box-shadow: 0 15px 50px rgba(0, 0, 0, 0.7);
+            overflow: hidden;
+            background-color: #70c5ce;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <canvas id="gameCanvas"></canvas>
+</div>
+
+<script>
+// --- 安全なストレージアクセストラッパー (file:// セキュリティ制限対策) ---
+function safeGetStorage(key, defaultValue) {
+    try {
+        var val = localStorage.getItem(key);
+        return val !== null ? val : defaultValue;
+    } catch (e) {
+        return defaultValue;
+    }
+}
+
+function safeSetStorage(key, value) {
+    try {
+        localStorage.setItem(key, value);
+    } catch (e) {}
+}
+
+// --- 角丸四角形描画互換関数 (非対応ブラウザ対策) ---
+function drawRoundRect(ctx, x, y, width, height, radius) {
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.lineTo(x + width - radius, y);
+    ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+    ctx.lineTo(x + width, y + height - radius);
+    ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+    ctx.lineTo(x + radius, y + height);
+    ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+    ctx.lineTo(x, y + radius);
+    ctx.quadraticCurveTo(x, y, x + radius, y);
+    ctx.closePath();
+}
+
+// --- システム定数 ---
+var LOGICAL_WIDTH = 480;
+var LOGICAL_HEIGHT = 720;
+var GROUND_HEIGHT = 90;
+
+var STATE_START = 0;
+var STATE_PLAYING = 1;
+var STATE_GAMEOVER = 2;
+
+// --- Web Audio API (効果音) ---
+class SoundSystem {
+    constructor() {
+        this.ctx = null;
+    }
+
+    init() {
+        if (!this.ctx) {
+            try {
+                var AudioContextClass = window.AudioContext || window.webkitAudioContext;
+                if (AudioContextClass) {
+                    this.ctx = new AudioContextClass();
+                }
+            } catch (e) {}
+        }
+        if (this.ctx && this.ctx.state === 'suspended') {
+            try { this.ctx.resume(); } catch (e) {}
+        }
+    }
+
+    playJump() {
+        if (!this.ctx) return;
+        try {
+            var now = this.ctx.currentTime;
+            var osc = this.ctx.createOscillator();
+            var gain = this.ctx.createGain();
+
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(360, now);
+            osc.frequency.exponentialRampToValueAtTime(760, now + 0.1);
+
+            gain.gain.setValueAtTime(0.25, now);
+            gain.gain.exponentialRampToValueAtTime(0.01, now + 0.1);
+
+            osc.connect(gain);
+            gain.connect(this.ctx.destination);
+
+            osc.start(now);
+            osc.stop(now + 0.1);
+        } catch (e) {}
+    }
+
+    playScore() {
+        if (!this.ctx) return;
+        try {
+            var now = this.ctx.currentTime;
+            var osc = this.ctx.createOscillator();
+            var gain = this.ctx.createGain();
+
+            osc.type = 'triangle';
+            osc.frequency.setValueAtTime(523.25, now);
+            osc.frequency.setValueAtTime(659.25, now + 0.08);
+
+            gain.gain.setValueAtTime(0.2, now);
+            gain.gain.exponentialRampToValueAtTime(0.01, now + 0.2);
+
+            osc.connect(gain);
+            gain.connect(this.ctx.destination);
+
+            osc.start(now);
+            osc.stop(now + 0.2);
+        } catch (e) {}
+    }
+
+    playHit() {
+        if (!this.ctx) return;
+        try {
+            var now = this.ctx.currentTime;
+            var osc = this.ctx.createOscillator();
+            var gain = this.ctx.createGain();
+
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(160, now);
+            osc.frequency.exponentialRampToValueAtTime(40, now + 0.25);
+
+            gain.gain.setValueAtTime(0.4, now);
+            gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+
+            osc.connect(gain);
+            gain.connect(this.ctx.destination);
+
+            osc.start(now);
+            osc.stop(now + 0.25);
+        } catch (e) {}
+    }
+}
+
+// --- パーティクルエフェクト ---
+class Particle {
+    constructor(x, y, vx, vy, size, color, life, type) {
+        this.x = x;
+        this.y = y;
+        this.vx = vx;
+        this.vy = vy;
+        this.size = size;
+        this.color = color;
+        this.life = life;
+        this.maxLife = life;
+        this.type = type || 'square';
+        this.rotation = Math.random() * Math.PI * 2;
+        this.vRot = (Math.random() - 0.5) * 5;
+    }
+
+    update(dt) {
+        this.x += this.vx * dt;
+        this.y += this.vy * dt;
+        this.rotation += this.vRot * dt;
+        this.life -= dt;
+    }
+
+    draw(ctx) {
+        if (this.life <= 0) return;
+        var alpha = Math.max(0, this.life / this.maxLife);
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.translate(this.x, this.y);
+        ctx.rotate(this.rotation);
+        ctx.fillStyle = this.color;
+
+        if (this.type === 'circle') {
+            ctx.beginPath();
+            ctx.arc(0, 0, this.size, 0, Math.PI * 2);
+            ctx.fill();
+        } else {
+            ctx.fillRect(-this.size / 2, -this.size / 2, this.size, this.size);
+        }
+
+        ctx.restore();
+    }
+}
+
+// --- 背景オブジェクト (雲) ---
+class Cloud {
+    constructor() {
+        this.reset(true);
+    }
+
+    reset(initial) {
+        this.x = initial ? Math.random() * LOGICAL_WIDTH : LOGICAL_WIDTH + 100;
+        this.y = 40 + Math.random() * 220;
+        this.speed = 15 + Math.random() * 20;
+        this.scale = 0.6 + Math.random() * 0.7;
+    }
+
+    update(dt) {
+        this.x -= this.speed * dt;
+        if (this.x < -150) {
+            this.reset(false);
+        }
+    }
+
+    draw(ctx) {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        ctx.scale(this.scale, this.scale);
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+        ctx.beginPath();
+        ctx.arc(0, 0, 25, 0, Math.PI * 2);
+        ctx.arc(20, -10, 20, 0, Math.PI * 2);
+        ctx.arc(40, 0, 22, 0, Math.PI * 2);
+        ctx.arc(20, 10, 18, 0, Math.PI * 2);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+    }
+}
+
+// --- プレイヤー ---
+class Bird {
+    constructor() {
+        this.reset();
+    }
+
+    reset() {
+        this.x = 110;
+        this.y = LOGICAL_HEIGHT / 2 - 20;
+        this.radius = 18;
+        this.vy = 0;
+        this.gravity = 1150;
+        this.jumpForce = -380;
+        this.rotation = 0;
+        this.wingAngle = 0;
+        this.wingSpeed = 12;
+    }
+
+    jump() {
+        this.vy = this.jumpForce;
+        this.wingSpeed = 25;
+    }
+
+    update(dt, state) {
+        if (state === STATE_PLAYING || state === STATE_GAMEOVER) {
+            this.vy += this.gravity * dt;
+            if (this.vy > 750) this.vy = 750;
+            if (this.vy < -450) this.vy = -450;
+
+            this.y += this.vy * dt;
+
+            var targetRotation = Math.min(Math.PI / 2.2, Math.max(-Math.PI / 6, (this.vy / 600)));
+            this.rotation += (targetRotation - this.rotation) * 12 * dt;
+        } else if (state === STATE_START) {
+            this.y = (LOGICAL_HEIGHT / 2 - 30) + Math.sin(Date.now() * 0.004) * 12;
+            this.rotation = 0;
+        }
+
+        this.wingAngle += this.wingSpeed * dt;
+        if (this.wingSpeed > 12) {
+            this.wingSpeed -= 20 * dt;
+        }
+    }
+
+    draw(ctx) {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        ctx.rotate(this.rotation);
+
+        // 影
+        ctx.fillStyle = 'rgba(0,0,0,0.15)';
+        ctx.beginPath();
+        ctx.ellipse(2, 20, 16, 6, 0, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 尾羽
+        ctx.fillStyle = '#e67e22';
+        ctx.beginPath();
+        ctx.moveTo(-14, 0);
+        ctx.lineTo(-24, -8);
+        ctx.lineTo(-22, 2);
+        ctx.lineTo(-25, 10);
+        ctx.closePath();
+        ctx.fill();
+
+        // 体
+        var bodyGrad = ctx.createRadialGradient(-2, -4, 2, 0, 0, 20);
+        bodyGrad.addColorStop(0, '#ffe100');
+        bodyGrad.addColorStop(0.8, '#f39c12');
+        bodyGrad.addColorStop(1, '#d35400');
+        
+        ctx.fillStyle = bodyGrad;
+        ctx.beginPath();
+        ctx.arc(0, 0, 19, 0, Math.PI * 2);
+        ctx.fill();
+
+        // お腹
+        ctx.fillStyle = '#fffdf0';
+        ctx.beginPath();
+        ctx.arc(4, 6, 11, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 目
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(8, -7, 7, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = '#2c3e50';
+        ctx.beginPath();
+        ctx.arc(10, -7, 3.5, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(11.5, -8.5, 1.2, 0, Math.PI * 2);
+        ctx.fill();
+
+        // くちばし
+        var beakGrad = ctx.createLinearGradient(12, 0, 24, 0);
+        beakGrad.addColorStop(0, '#e74c3c');
+        beakGrad.addColorStop(1, '#c0392b');
+        ctx.fillStyle = beakGrad;
+        ctx.beginPath();
+        ctx.moveTo(12, -2);
+        ctx.lineTo(23, 2);
+        ctx.lineTo(12, 8);
+        ctx.closePath();
+        ctx.fill();
+
+        // 羽
+        var wingY = Math.sin(this.wingAngle) * 7;
+        ctx.fillStyle = '#f1c40f';
+        ctx.strokeStyle = '#d35400';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.ellipse(-4, wingY, 11, 6, Math.PI / 6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.restore();
+    }
+}
+
+// --- 障害物 ---
+class Pipe {
+    constructor(x, gapY, gapHeight, width) {
+        this.x = x;
+        this.gapY = gapY;
+        this.gapHeight = gapHeight;
+        this.width = width;
+        this.passed = false;
+        this.capHeight = 24;
+        this.capOffset = 4;
+    }
+
+    update(dt, speed) {
+        this.x -= speed * dt;
+    }
+
+    draw(ctx) {
+        var topPipeHeight = this.gapY;
+        var bottomPipeY = this.gapY + this.gapHeight;
+        var bottomPipeHeight = LOGICAL_HEIGHT - GROUND_HEIGHT - bottomPipeY;
+
+        var drawPipeBody = function(rectX, rectY, rectW, rectH) {
+            if (rectH <= 0) return;
+            var grad = ctx.createLinearGradient(rectX, 0, rectX + rectW, 0);
+            grad.addColorStop(0, '#27ae60');
+            grad.addColorStop(0.2, '#2ecc71');
+            grad.addColorStop(0.6, '#55efc4');
+            grad.addColorStop(0.8, '#2ecc71');
+            grad.addColorStop(1, '#1e8449');
+
+            ctx.fillStyle = grad;
+            ctx.fillRect(rectX, rectY, rectW, rectH);
+            ctx.strokeStyle = '#145a32';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(rectX, rectY, rectW, rectH);
+        };
+
+        var drawPipeCap = function(capX, capY, capW, capH) {
+            var grad = ctx.createLinearGradient(capX, 0, capX + capW, 0);
+            grad.addColorStop(0, '#27ae60');
+            grad.addColorStop(0.25, '#2ecc71');
+            grad.addColorStop(0.65, '#81ecec');
+            grad.addColorStop(0.85, '#2ecc71');
+            grad.addColorStop(1, '#145a32');
+
+            ctx.fillStyle = grad;
+            ctx.fillRect(capX, capY, capW, capH);
+            ctx.strokeStyle = '#0e3a21';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(capX, capY, capW, capH);
+        };
+
+        drawPipeBody(this.x, 0, this.width, topPipeHeight - this.capHeight);
+        drawPipeCap(this.x - this.capOffset, topPipeHeight - this.capHeight, this.width + this.capOffset * 2, this.capHeight);
+
+        drawPipeCap(this.x - this.capOffset, bottomPipeY, this.width + this.capOffset * 2, this.capHeight);
+        drawPipeBody(this.x, bottomPipeY + this.capHeight, this.width, bottomPipeHeight - this.capHeight);
+    }
+}
+
+// --- メインゲームクラス ---
+class Game {
+    constructor() {
+        this.canvas = document.getElementById('gameCanvas');
+        this.ctx = this.canvas.getContext('2d');
+        this.container = document.getElementById('game-container');
+
+        this.sound = new SoundSystem();
+        this.bird = new Bird();
+
+        this.pipes = [];
+        this.clouds = [new Cloud(), new Cloud(), new Cloud()];
+        this.particles = [];
+
+        this.state = STATE_START;
+        this.score = 0;
+        this.highScore = parseInt(safeGetStorage('skydash_highscore', '0'), 10);
+
+        this.lastTime = 0;
+        this.spawnTimer = 0;
+        this.groundScroll = 0;
+
+        this.currentSpeed = 190;
+        this.currentGap = 155;
+        this.lastGapY = LOGICAL_HEIGHT / 2 - 50;
+
+        this.shakeTimer = 0;
+        this.shakeIntensity = 0;
+        this.gameOverCooldown = 0;
+
+        this.initCanvasSize();
+        this.bindEvents();
+
+        requestAnimationFrame(this.loop.bind(this));
+    }
+
+    initCanvasSize() {
+        this.canvas.width = LOGICAL_WIDTH;
+        this.canvas.height = LOGICAL_HEIGHT;
+    }
+
+    bindEvents() {
+        var self = this;
+        var handleAction = function(e) {
+            if (e && e.type === 'keydown') {
+                if (['Space', 'Enter', 'ArrowUp'].indexOf(e.code) !== -1 || ['Space', 'Enter', 'ArrowUp'].indexOf(e.key) !== -1) {
+                    if (e.preventDefault) e.preventDefault();
+                } else {
+                    return;
+                }
+            }
+
+            self.sound.init();
+
+            if (self.state === STATE_START) {
+                self.startGame();
+            } else if (self.state === STATE_PLAYING) {
+                self.bird.jump();
+                self.sound.playJump();
+                self.createJumpParticles();
+            } else if (self.state === STATE_GAMEOVER) {
+                if (self.gameOverCooldown <= 0) {
+                    self.resetGame();
+                }
+            }
+        };
+
+        window.addEventListener('keydown', handleAction);
+        
+        this.container.addEventListener('pointerdown', function(e) {
+            if (e.preventDefault) e.preventDefault();
+            handleAction(e);
+        });
+    }
+
+    startGame() {
+        this.state = STATE_PLAYING;
+        this.bird.jump();
+        this.sound.playJump();
+        this.createJumpParticles();
+    }
+
+    resetGame() {
+        this.score = 0;
+        this.pipes = [];
+        this.particles = [];
+        this.bird.reset();
+        this.currentSpeed = 190;
+        this.currentGap = 155;
+        this.spawnTimer = 0;
+        this.lastGapY = LOGICAL_HEIGHT / 2 - 50;
+        this.state = STATE_START;
+    }
+
+    triggerShake(intensity, duration) {
+        this.shakeIntensity = intensity;
+        this.shakeTimer = duration;
+    }
+
+    createJumpParticles() {
+        for (var i = 0; i < 5; i++) {
+            this.particles.push(new Particle(
+                this.bird.x - 12,
+                this.bird.y + (Math.random() - 0.5) * 10,
+                -60 - Math.random() * 80,
+                (Math.random() - 0.5) * 40,
+                3 + Math.random() * 3,
+                'rgba(255, 255, 255, 0.8)',
+                0.3 + Math.random() * 0.2,
+                'circle'
+            ));
+        }
+    }
+
+    createScoreParticles() {
+        var colors = ['#f1c40f', '#e67e22', '#2ecc71', '#3498db'];
+        for (var i = 0; i < 15; i++) {
+            this.particles.push(new Particle(
+                this.bird.x,
+                this.bird.y,
+                (Math.random() - 0.5) * 200,
+                (Math.random() - 0.5) * 200,
+                4 + Math.random() * 4,
+                colors[Math.floor(Math.random() * colors.length)],
+                0.5 + Math.random() * 0.3,
+                'square'
+            ));
+        }
+    }
+
+    createHitParticles() {
+        var colors = ['#e74c3c', '#f39c12', '#ffffff'];
+        for (var i = 0; i < 25; i++) {
+            this.particles.push(new Particle(
+                this.bird.x,
+                this.bird.y,
+                (Math.random() - 0.5) * 350,
+                (Math.random() - 0.5) * 350,
+                4 + Math.random() * 5,
+                colors[Math.floor(Math.random() * colors.length)],
+                0.4 + Math.random() * 0.4,
+                'circle'
+            ));
+        }
+    }
+
+    spawnPipe() {
+        this.currentSpeed = Math.min(320, 190 + this.score * 3.0);
+        this.currentGap = Math.max(115, 155 - this.score * 0.85);
+
+        var minGapY = 90;
+        var maxGapY = LOGICAL_HEIGHT - GROUND_HEIGHT - this.currentGap - 90;
+
+        var maxChange = 180;
+        var gapY = this.lastGapY + (Math.random() * maxChange * 2 - maxChange);
+        gapY = Math.max(minGapY, Math.min(maxGapY, gapY));
+
+        this.lastGapY = gapY;
+        this.pipes.push(new Pipe(LOGICAL_WIDTH + 20, gapY, this.currentGap, 64));
+    }
+
+    update(dt) {
+        if (this.gameOverCooldown > 0) {
+            this.gameOverCooldown -= dt;
+        }
+
+        if (this.shakeTimer > 0) {
+            this.shakeTimer -= dt;
+        }
+
+        this.clouds.forEach(function(cloud) { cloud.update(dt); });
+        this.bird.update(dt, this.state);
+
+        for (var i = this.particles.length - 1; i >= 0; i--) {
+            this.particles[i].update(dt);
+            if (this.particles[i].life <= 0) {
+                this.particles.splice(i, 1);
+            }
+        }
+
+        if (this.state === STATE_PLAYING) {
+            this.groundScroll = (this.groundScroll + this.currentSpeed * dt) % 24;
+
+            var spawnInterval = Math.max(1.1, 1.85 - (this.currentSpeed - 190) * 0.0035);
+            this.spawnTimer += dt;
+            if (this.spawnTimer >= spawnInterval) {
+                this.spawnPipe();
+                this.spawnTimer = 0;
+            }
+
+            for (var j = this.pipes.length - 1; j >= 0; j--) {
+                var pipe = this.pipes[j];
+                pipe.update(dt, this.currentSpeed);
+
+                if (!pipe.passed && pipe.x + pipe.width < this.bird.x) {
+                    pipe.passed = true;
+                    this.score++;
+                    if (this.score > this.highScore) {
+                        this.highScore = this.score;
+                        safeSetStorage('skydash_highscore', this.highScore.toString());
+                    }
+                    this.sound.playScore();
+                    this.createScoreParticles();
+                }
+
+                if (pipe.x < -pipe.width - 20) {
+                    this.pipes.splice(j, 1);
+                    continue;
+                }
+
+                if (this.checkPipeCollision(this.bird, pipe)) {
+                    this.gameOver();
+                }
+            }
+
+            if (this.bird.y - this.bird.radius <= 0) {
+                this.bird.y = this.bird.radius;
+                this.gameOver();
+            } else if (this.bird.y + this.bird.radius >= LOGICAL_HEIGHT - GROUND_HEIGHT) {
+                this.bird.y = LOGICAL_HEIGHT - GROUND_HEIGHT - this.bird.radius;
+                this.gameOver();
+            }
+        }
+    }
+
+    checkPipeCollision(bird, pipe) {
+        var r = bird.radius - 3;
+        var cx = bird.x;
+        var cy = bird.y;
+
+        var topRect = { x: pipe.x - pipe.capOffset, y: 0, w: pipe.width + pipe.capOffset * 2, h: pipe.gapY };
+        var botRect = { 
+            x: pipe.x - pipe.capOffset, 
+            y: pipe.gapY + pipe.gapHeight, 
+            w: pipe.width + pipe.capOffset * 2, 
+            h: LOGICAL_HEIGHT - (pipe.gapY + pipe.gapHeight) 
+        };
+
+        return this.circleRectIntersect(cx, cy, r, topRect) || this.circleRectIntersect(cx, cy, r, botRect);
+    }
+
+    circleRectIntersect(cx, cy, r, rect) {
+        var closestX = Math.max(rect.x, Math.min(cx, rect.x + rect.w));
+        var closestY = Math.max(rect.y, Math.min(cy, rect.y + rect.h));
+        var distX = cx - closestX;
+        var distY = cy - closestY;
+        return (distX * distX + distY * distY) < (r * r);
+    }
+
+    gameOver() {
+        if (this.state === STATE_GAMEOVER) return;
+        this.state = STATE_GAMEOVER;
+        this.gameOverCooldown = 0.4;
+        this.sound.playHit();
+        this.triggerShake(14, 0.3);
+        this.createHitParticles();
+    }
+
+    draw() {
+        this.ctx.save();
+
+        if (this.shakeTimer > 0) {
+            var dx = (Math.random() - 0.5) * this.shakeIntensity;
+            var dy = (Math.random() - 0.5) * this.shakeIntensity;
+            this.ctx.translate(dx, dy);
+        }
+
+        // 1. 空
+        var bgGrad = this.ctx.createLinearGradient(0, 0, 0, LOGICAL_HEIGHT);
+        bgGrad.addColorStop(0, '#4a90e2');
+        bgGrad.addColorStop(0.6, '#70c5ce');
+        bgGrad.addColorStop(1, '#9be2e8');
+        this.ctx.fillStyle = bgGrad;
+        this.ctx.fillRect(0, 0, LOGICAL_WIDTH, LOGICAL_HEIGHT);
+
+        // 遠景
+        this.drawMountains();
+
+        // 2. 雲
+        this.clouds.forEach(function(cloud) { cloud.draw(this.ctx); }.bind(this));
+
+        // 3. パイプ
+        this.pipes.forEach(function(pipe) { pipe.draw(this.ctx); }.bind(this));
+
+        // 4. 地面
+        this.drawGround();
+
+        // 5. パーティクル
+        this.particles.forEach(function(p) { p.draw(this.ctx); }.bind(this));
+
+        // 6. プレイヤー
+        this.bird.draw(this.ctx);
+
+        // 7. UI
+        this.drawUI();
+
+        this.ctx.restore();
+    }
+
+    drawMountains() {
+        this.ctx.fillStyle = '#62b2b7';
+        this.ctx.beginPath();
+        this.ctx.moveTo(0, LOGICAL_HEIGHT - GROUND_HEIGHT);
+        this.ctx.lineTo(60, LOGICAL_HEIGHT - GROUND_HEIGHT - 70);
+        this.ctx.lineTo(150, LOGICAL_HEIGHT - GROUND_HEIGHT);
+        this.ctx.lineTo(230, LOGICAL_HEIGHT - GROUND_HEIGHT - 90);
+        this.ctx.lineTo(340, LOGICAL_HEIGHT - GROUND_HEIGHT);
+        this.ctx.lineTo(410, LOGICAL_HEIGHT - GROUND_HEIGHT - 60);
+        this.ctx.lineTo(LOGICAL_WIDTH, LOGICAL_HEIGHT - GROUND_HEIGHT);
+        this.ctx.closePath();
+        this.ctx.fill();
+    }
+
+    drawGround() {
+        var groundY = LOGICAL_HEIGHT - GROUND_HEIGHT;
+
+        this.ctx.fillStyle = '#e67e22';
+        this.ctx.fillRect(0, groundY, LOGICAL_WIDTH, GROUND_HEIGHT);
+
+        this.ctx.fillStyle = '#2ecc71';
+        this.ctx.fillRect(0, groundY, LOGICAL_WIDTH, 16);
+        this.ctx.fillStyle = '#27ae60';
+        this.ctx.fillRect(0, groundY + 12, LOGICAL_WIDTH, 4);
+
+        this.ctx.fillStyle = '#d35400';
+        this.ctx.beginPath();
+        for (var x = -24; x < LOGICAL_WIDTH + 24; x += 24) {
+            var drawX = x - this.groundScroll;
+            this.ctx.moveTo(drawX, groundY + 16);
+            this.ctx.lineTo(drawX + 12, groundY + 16);
+            this.ctx.lineTo(drawX - 4, groundY + GROUND_HEIGHT);
+            this.ctx.lineTo(drawX - 16, groundY + GROUND_HEIGHT);
+        }
+        this.ctx.closePath();
+        this.ctx.fill();
+
+        this.ctx.strokeStyle = '#1e8449';
+        this.ctx.lineWidth = 2;
+        this.ctx.beginPath();
+        this.ctx.moveTo(0, groundY);
+        this.ctx.lineTo(LOGICAL_WIDTH, groundY);
+        this.ctx.stroke();
+    }
+
+    drawUI() {
+        this.ctx.textAlign = 'center';
+
+        if (this.state === STATE_START) {
+            this.ctx.font = '900 46px sans-serif';
+            this.ctx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+            this.ctx.fillText('SKY DASH', LOGICAL_WIDTH / 2 + 3, 183);
+
+            this.ctx.fillStyle = '#ffffff';
+            this.ctx.strokeStyle = '#2c3e50';
+            this.ctx.lineWidth = 6;
+            this.ctx.strokeText('SKY DASH', LOGICAL_WIDTH / 2, 180);
+            this.ctx.fillText('SKY DASH', LOGICAL_WIDTH / 2, 180);
+
+            this.drawCard(LOGICAL_WIDTH / 2, 450, 320, 140);
+            
+            this.ctx.font = '600 20px sans-serif';
+            this.ctx.fillStyle = '#2c3e50';
+            this.ctx.fillText('Tap / Click / Space', LOGICAL_WIDTH / 2, 435);
+            this.ctx.font = '800 22px sans-serif';
+            this.ctx.fillStyle = '#e67e22';
+            this.ctx.fillText('TO FLY', LOGICAL_WIDTH / 2, 468);
+
+            this.ctx.font = '600 16px sans-serif';
+            this.ctx.fillStyle = '#7f8c8d';
+            this.ctx.fillText('BEST SCORE: ' + this.highScore, LOGICAL_WIDTH / 2, 510);
+
+        } else if (this.state === STATE_PLAYING) {
+            this.ctx.font = '900 52px sans-serif';
+            this.ctx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
+            this.ctx.lineWidth = 6;
+            this.ctx.strokeText('' + this.score, LOGICAL_WIDTH / 2, 90);
+            this.ctx.fillStyle = '#ffffff';
+            this.ctx.fillText('' + this.score, LOGICAL_WIDTH / 2, 90);
+
+        } else if (this.state === STATE_GAMEOVER) {
+            this.drawCard(LOGICAL_WIDTH / 2, 330, 340, 260);
+
+            this.ctx.font = '900 38px sans-serif';
+            this.ctx.fillStyle = '#e74c3c';
+            this.ctx.strokeStyle = '#ffffff';
+            this.ctx.lineWidth = 4;
+            this.ctx.strokeText('GAME OVER', LOGICAL_WIDTH / 2, 240);
+            this.ctx.fillText('GAME OVER', LOGICAL_WIDTH / 2, 240);
+
+            this.ctx.font = '600 18px sans-serif';
+            this.ctx.fillStyle = '#7f8c8d';
+            this.ctx.fillText('SCORE', LOGICAL_WIDTH / 2 - 70, 310);
+            this.ctx.font = '900 36px sans-serif';
+            this.ctx.fillStyle = '#2c3e50';
+            this.ctx.fillText('' + this.score, LOGICAL_WIDTH / 2 - 70, 350);
+
+            this.ctx.font = '600 18px sans-serif';
+            this.ctx.fillStyle = '#7f8c8d';
+            this.ctx.fillText('BEST', LOGICAL_WIDTH / 2 + 70, 310);
+            this.ctx.font = '900 36px sans-serif';
+            this.ctx.fillStyle = '#f39c12';
+            this.ctx.fillText('' + this.highScore, LOGICAL_WIDTH / 2 + 70, 350);
+
+            if (Math.floor(Date.now() / 400) % 2 === 0) {
+                this.ctx.font = '800 20px sans-serif';
+                this.ctx.fillStyle = '#2980b9';
+                this.ctx.fillText('TAP OR SPACE TO RETRY', LOGICAL_WIDTH / 2, 425);
+            }
+        }
+    }
+
+    drawCard(cx, cy, w, h) {
+        this.ctx.save();
+        var x = cx - w / 2;
+        var y = cy - h / 2;
+
+        this.ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
+        drawRoundRect(this.ctx, x + 4, y + 6, w, h, 16);
+        this.ctx.fill();
+
+        this.ctx.fillStyle = 'rgba(255, 255, 255, 0.92)';
+        drawRoundRect(this.ctx, x, y, w, h, 16);
+        this.ctx.fill();
+
+        this.ctx.strokeStyle = '#ffffff';
+        this.ctx.lineWidth = 3;
+        this.ctx.stroke();
+
+        this.ctx.restore();
+    }
+
+    loop(timestamp) {
+        if (!this.lastTime) this.lastTime = timestamp;
+        var dt = (timestamp - this.lastTime) / 1000;
+        this.lastTime = timestamp;
+
+        if (dt > 0.05) dt = 0.05;
+
+        this.update(dt);
+        this.draw();
+
+        requestAnimationFrame(this.loop.bind(this));
+    }
+}
+
+// 起動処理
+window.addEventListener('load', function() {
+    new Game();
+});
+</script>
+</body>
+</html>
