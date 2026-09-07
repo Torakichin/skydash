@@ -576,11 +576,11 @@ class Game {
             }
 
             // スピードの上昇
-            this.obstacleSpeed = 190 + Math.min(150, this.score * 3);
+            this.obstacleSpeed = 150 + Math.min(100, this.score * 1.5);
 
             // 障害物の生成タイマー
             this.spawnTimer += dt;
-            if (this.spawnTimer > 1.65 - Math.min(0.5, this.score * 0.015)) {
+            if (this.spawnTimer > 3.0 - Math.min(0.5, this.score * 0.005)) {
                 this.spawnTimer = 0;
                 this.spawnObstacle();
             }
